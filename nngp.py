@@ -1,4 +1,5 @@
 import numpy as np
+import scipy.stats as stats
 
 from scipy.linalg import solve_triangular
 from scipy.optimize import minimize
@@ -145,3 +146,92 @@ def psd_convert(K):
         K_new = v @ np.diag(l_new) @ v.T
         print("The matrix is successfully converted.")
         return K_new
+
+
+class NNGPIU:
+    def __init__(self, theta=np.ones(2), alpha=1e-8, n_layers=3, theta_bounds=None, n_restart=0, input_noise=None):
+        self.theta = theta
+        self.alpha = alpha
+        self.n_layers = n_layers
+        self.n_restart = n_restart
+        if theta_bounds == None:
+            # theta_bounds should be a list
+            self.theta_bounds = [(1e-4, 1e4) for _ in range(len(self.theta))]
+        else:
+            assert len(theta_bounds) == len(theta)
+            self.theta_bounds = theta_bounds
+        if input_noise == None:
+            self.input_noise = stats.norm(loc=0, scale=1e-3)
+        else:
+            self.input_noise = input_noise
+
+    def neg_log_likelihood(self, theta):
+        K = np.zeros((len(self.u), len(self.X), len(self.X)))
+        Xu = self.X + self.u
+        for i in range(len(self.u)):
+            K[i] = ArccosKernel(Xu[i], theta=theta, n_layers=self.n_layers)
+        K = K.sum(axis=0)
+        K /= len(self.u)
+        K += np.eye(self.n) * self.alpha
+        try:
+            self.L = np.linalg.cholesky(K)
+            self.a = solve_triangular(self.L.T, solve_triangular(self.L, self.y, lower=True))
+        except:
+            print(theta)
+        return 0.5 * np.dot(self.y, self.a) + np.log(np.diag(self.L)).sum() + 0.5 * self.n * np.log(2 * np.pi)
+
+    def fit(self, X, y, m=500):
+        if len(X) != len(y):
+            raise Exception("InconsistentDataError: len(X) != len(y)")
+
+        if np.ndim(X) != 2:
+            raise Exception("InputShapeError: ndim(X) != 2")
+
+        self.X = X.copy()
+        self.y = y.copy()
+        self.n = len(self.X)
+        self.u = self.input_noise.rvs(size=(m, self.n))
+
+        res = minimize(self.neg_log_likelihood, self.theta, method='L-BFGS-B', bounds=self.theta_bounds)
+        self.nlm = res.fun
+        self.theta = res.x
+
+        if self.n_restart > 0:
+            nlm_cand = [self.nlm]
+            theta_cand = [self.theta]
+            L_cand = [self.L]
+            a_cand = [self.a]
+
+            while self.n_restart > 0:
+                theta0 = np.random.uniform([self.theta_bounds[i][0] for i in range(len(self.theta))],
+                                           [self.theta_bounds[i][1] for i in range(len(self.theta))])
+                res = minimize(self.neg_log_likelihood, theta0, method='L-BFGS-B', bounds=self.theta_bounds)
+
+                nlm_cand.append(res.fun)
+                theta_cand.append(res.x)
+                L_cand.append(self.L)
+                a_cand.append(self.a)
+                self.n_restart -= 1
+
+            min_index = np.argmin(nlm_cand)
+            self.nlm = nlm_cand[min_index]
+            self.theta = theta_cand[min_index]
+            self.L = L_cand[min_index]
+            self.a = a_cand[min_index]
+
+        self.K = ArccosKernel(X, theta=self.theta, n_layers=self.n_layers) + np.eye(self.n) * self.alpha
+
+    def predict(self, X_new, return_std=False):
+        k_new = ArccosKernel(self.X, X_new, theta=self.theta, n_layers=self.n_layers)
+        y_new = k_new.T @ self.a
+        if return_std:
+            v = solve_triangular(self.L, k_new, lower=True)
+            std_new = np.diag(ArccosKernel(X_new, theta=self.theta, n_layers=self.n_layers)) \
+                      + self.alpha - np.diag(v.T @ v)
+
+            # for i in range(len(X_new)):
+            #     std_new[i] = ArccosKernel(X_new[i][np.newaxis, :], theta=self.theta, n_layers=self.n_layers) \
+            #                  + np.finfo(np.float32).eps - np.dot(v[:, i], v[:, i])
+            return y_new, std_new
+        else:
+            return y_new
