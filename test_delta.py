@@ -1,7 +1,7 @@
 import math
 import unittest
 import torch
-from nngp_delta import kernel_delta, expected_log_likelihood_delta
+from nngp_delta import kernel_delta, expected_log_likelihood_delta, expected_log_likelihood_delta_reference
 from nngp_torch import GenArccos, NNGP_EIV
 from nngp_torch_joint import NNGP_EIV_Joint
 
@@ -114,6 +114,23 @@ class DeltaTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(k.log_D.grad).all())
         with torch.no_grad():
             self.assertTrue(torch.isfinite(kernel_delta(k,x,variance)).all())
+
+    def test_sparse_likelihood_matches_reference_value_and_gradients(self):
+        torch.manual_seed(123)
+        for dimensions in (1, 4):
+            for layers in (1, 3):
+                k=GenArccos(dimensions,layers,[0.7]*layers,[1.4]*layers)
+                x=torch.randn(5,dimensions); y=torch.randn(5,1)
+                variance=torch.full((dimensions,),0.002,requires_grad=True)
+                sigma=torch.tensor(0.3,requires_grad=True)
+                parameters=[*k.parameters(),variance,sigma]
+                fast=expected_log_likelihood_delta(k,x,y,variance,sigma)
+                reference=expected_log_likelihood_delta_reference(k,x,y,variance,sigma)
+                torch.testing.assert_close(fast,reference,rtol=1e-9,atol=1e-9)
+                fast_grad=torch.autograd.grad(fast,parameters)
+                ref_grad=torch.autograd.grad(reference,parameters)
+                for actual,expected in zip(fast_grad,ref_grad):
+                    torch.testing.assert_close(actual,expected,rtol=1e-8,atol=1e-8)
 
     def test_zero_variance(self):
         k=GenArccos(2,2,[0.7,0.5],[1.4,1.2])

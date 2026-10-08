@@ -60,7 +60,7 @@ def kernel_delta(kernel, X, variance_x, Y=None, variance_y=None):
     return correction if outer_grad else correction.detach()
 
 
-def expected_log_likelihood_delta(kernel, X, y, variance, sigma):
+def expected_log_likelihood_delta_reference(kernel, X, y, variance, sigma):
     """Taylor approximation to E_q[log N(y; 0, K(W)+sigma**2 I)].
 
     This approximates the ELBO expectation; Taylor truncation is not itself
@@ -73,4 +73,55 @@ def expected_log_likelihood_delta(kernel, X, y, variance, sigma):
         L = torch.linalg.cholesky(covariance)
         log_lik = -0.5 * (y * torch.cholesky_solve(y, L)).sum() - L.diagonal().log().sum() - 0.5 * len(X) * math.log(2 * math.pi)
         result = log_lik + 0.5 * diagonal_hessian_trace(log_lik, z, variance, outer_grad)
+    return result if outer_grad else result.detach()
+
+
+def expected_log_likelihood_delta(kernel, X, y, variance, sigma):
+    """Same likelihood Delta approximation using sparse covariance derivatives.
+
+    Perturbing x[i,d] changes only covariance row/column i. If its first
+    derivative is e_i r^T+r e_i^T and second is e_i t^T+t e_i^T,
+    the log-likelihood Hessian follows from the Gaussian matrix chain rule.
+    This avoids N*D reverse passes through a Cholesky decomposition.
+    """
+    outer_grad = torch.is_grad_enabled()
+    N, D = X.shape
+    with torch.enable_grad():
+        covariance = kernel(X) + sigma.square() * torch.eye(N, dtype=X.dtype, device=X.device)
+        L = torch.linalg.cholesky(covariance)
+        alpha = torch.cholesky_solve(y, L).squeeze(-1)
+        inverse = torch.cholesky_inverse(L)
+        log_lik = -0.5 * (y.squeeze(-1) * alpha).sum() - L.diagonal().log().sum() - 0.5 * N * math.log(2 * math.pi)
+        a = X[:, None, :].expand(-1, N, -1).reshape(-1, D).detach().clone().requires_grad_(True)
+        b = X[None, :, :].expand(N, -1, -1).reshape(-1, D).detach()
+        vals = kernel.paired(a, b)
+        first = torch.autograd.grad(vals.sum(), a, create_graph=True)[0]
+        second_terms = []
+        for d in range(D):
+            second = torch.autograd.grad(first[:, d].sum(), a,
+                create_graph=outer_grad, retain_graph=True, allow_unused=True)[0] if first[:, d].requires_grad else None
+            second_terms.append(torch.zeros_like(vals) if second is None else second[:, d])
+        second = torch.stack(second_terms, -1).reshape(N, N, D)
+        z = X.detach().clone().requires_grad_(True)
+        diagonal = kernel.diagonal(z)
+        diag_first = torch.autograd.grad(diagonal.sum(), z, create_graph=True)[0]
+        diag_second_terms = []
+        for d in range(D):
+            result = torch.autograd.grad(diag_first[:, d].sum(), z,
+                create_graph=outer_grad, retain_graph=True, allow_unused=True)[0] if diag_first[:, d].requires_grad else None
+            diag_second_terms.append(torch.zeros_like(diagonal) if result is None else result[:, d])
+        diag_second = torch.stack(diag_second_terms, -1)
+        mask = torch.eye(N, dtype=torch.bool, device=X.device)[:, :, None]
+        r = torch.where(mask, 0.5 * diag_first[:, None, :], first.reshape(N, N, D)).permute(0, 2, 1)
+        t = torch.where(mask, 0.5 * diag_second[:, None, :], second).permute(0, 2, 1)
+        B = torch.outer(alpha, alpha) - inverse
+        Ar = r @ inverse
+        rAr = (r * Ar).sum(-1)
+        Ari = Ar.diagonal(dim1=0, dim2=2).T
+        ar = (r * alpha).sum(-1)
+        ai = alpha[:, None]
+        Aii = inverse.diagonal()[:, None]
+        hessian_diagonal = ((B[:, None, :] * t).sum(-1) + Ari.square()
+            + (Aii - ai.square()) * rAr - 2 * ai * ar * Ari - ar.square() * Aii)
+        result = log_lik + 0.5 * (hessian_diagonal * variance).sum()
     return result if outer_grad else result.detach()
