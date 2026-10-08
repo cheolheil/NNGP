@@ -1,7 +1,9 @@
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
 import math
+import platform
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -10,21 +12,22 @@ import matplotlib.pyplot as plt
 # 1. THE PYTORCH ARCCOSINE KERNEL
 # ==========================================
 class GenArccos(nn.Module):
-    def __init__(self, input_dim, n_layers, s_b, s_w, D=None):
+    def __init__(self, input_dim, n_layers, s_b, s_w, D=None, dtype=torch.float64):
         super().__init__()
         self.input_dim = input_dim
         self.n_layers = n_layers
+        self.dtype = dtype
         
-        s_b = torch.atleast_1d(torch.tensor(s_b, dtype=torch.float64))
-        s_w = torch.atleast_1d(torch.tensor(s_w, dtype=torch.float64))
+        s_b = torch.atleast_1d(torch.tensor(s_b, dtype=dtype))
+        s_w = torch.atleast_1d(torch.tensor(s_w, dtype=dtype))
         
         if D is None:
             self._D_fixed = True
-            self.register_buffer('D', torch.ones(input_dim, dtype=torch.float64) / input_dim)
+            self.register_buffer('D', torch.ones(input_dim, dtype=dtype) / input_dim)
             self.log_s_b = nn.Parameter(torch.log(s_b))
             self.log_s_w = nn.Parameter(torch.log(s_w))
         else:
-            D = torch.atleast_1d(torch.tensor(D, dtype=torch.float64))
+            D = torch.atleast_1d(torch.tensor(D, dtype=dtype))
             self._D_fixed = False
             self.log_s_b = nn.Parameter(torch.log(s_b))
             self.log_s_w = nn.Parameter(torch.log(s_w[1:])) 
@@ -95,86 +98,155 @@ class GenArccos(nn.Module):
 # ==========================================
 # 2. THE PYTORCH NNGP-EIV CLASS
 # ==========================================
-class NNGP_EIV_PyTorch(nn.Module):
-    def __init__(self, kernel, input_dim, S_u_init=1e-3, sigma_obs_init=0.1):
+class NNGP_EIV(nn.Module):
+    def __init__(self, kernel, input_dim, S_u_init=1e-3, sigma_obs_init=0.1, V_init=1e-3, dtype=torch.float64):
         super().__init__()
         self.kernel = kernel
         self.input_dim = input_dim
+        self.dtype = dtype
         
-        self.log_S_u = nn.Parameter(torch.full((input_dim,), math.log(S_u_init), dtype=torch.float64))
-        self.log_sigma_obs = nn.Parameter(torch.tensor(math.log(sigma_obs_init), dtype=torch.float64))
+        if isinstance(S_u_init, (int, float)):
+            S_u_tensor = torch.full((input_dim,), S_u_init, dtype=dtype)
+        else:
+            S_u_tensor = torch.as_tensor(S_u_init, dtype=dtype)
+            
+        if isinstance(V_init, (int, float)):
+            V_tensor = torch.full((input_dim,), V_init, dtype=dtype)
+        else:
+            V_tensor = torch.as_tensor(V_init, dtype=dtype)
+
+        self.log_S_u = nn.Parameter(torch.log(S_u_tensor))
+        self.log_sigma_obs = nn.Parameter(torch.tensor(math.log(sigma_obs_init), dtype=dtype))
+        self.log_V = nn.Parameter(torch.log(V_tensor))
         
-        self.history = {'loss': [], 'S_u': []}
+        self.history = {'loss': [], 'elbo': [], 'S_u': [], 'V': []}
 
     @property
     def S_u(self): return torch.exp(self.log_S_u)
     @property
     def sigma_obs(self): return torch.exp(self.log_sigma_obs)
+    @property
+    def V(self): return torch.exp(self.log_V)
 
-    def _compute_delta_correction(self, X, n_probes=10):
+    def _compute_delta_correction(self, X, V_override=None):
         N, D = X.shape
-        point_corrections = torch.zeros(N, device=X.device, dtype=X.dtype)
-        S_u_curr = self.S_u
-        
-        def f(x_in):
-            return self.kernel(x_in)[0, 0]
+        V_curr = V_override if V_override is not None else self.V
 
-        for i in range(N):
-            x_i = X[i:i+1]
-            tr_est = 0.0
-            
-            # Hutchinson Trace Estimator via HVP
-            for _ in range(n_probes):
-                z = torch.randint(0, 2, (1, D), device=X.device, dtype=X.dtype) * 2.0 - 1.0
-                v = torch.sqrt(S_u_curr) * z
-                _, hvp = torch.autograd.functional.hvp(f, x_i, v)
-                tr_est += torch.sum(v * hvp)
-                
-            point_corrections[i] = 0.5 * (tr_est / n_probes)
-            
+        with torch.enable_grad():
+            X_req = X.detach().clone().requires_grad_(True)
+            K_diag = torch.diag(self.kernel(X_req))
+
+            g1 = torch.autograd.grad(K_diag.sum(), X_req, create_graph=True)[0]
+
+            second_diag = torch.zeros_like(X_req)
+            for d in range(D):
+                g2_d = torch.autograd.grad(g1[:, d].sum(), X_req, create_graph=True if self.training else False)[0][:, d]
+                second_diag[:, d] = g2_d
+
+            point_corrections = 0.5 * torch.sum(second_diag * V_curr, dim=1)
         return point_corrections.unsqueeze(1) + point_corrections.unsqueeze(0)
 
-    def forward(self, X, y):
+    def compute_elbo(self, X, y):
+        N, D = X.shape
         K_nom = self.kernel(X)
         K_corr = self._compute_delta_correction(X)
-        jitter = (self.sigma_obs**2) * torch.eye(X.shape[0], device=X.device, dtype=X.dtype)
+        jitter = (self.sigma_obs**2) * torch.eye(N, device=X.device, dtype=X.dtype)
         K_eff = K_nom + K_corr + jitter
-        
+
         L = torch.linalg.cholesky(K_eff)
         alpha = torch.cholesky_solve(y, L)
-        
-        data_fit = 0.5 * torch.sum(y * alpha)
-        complexity = torch.sum(torch.log(torch.diag(L)))
-        return data_fit + complexity
 
-    def fit(self, X, y, iter_warmup=20, iter_joint=80, lr=0.05):
+        data_fit = 0.5 * torch.sum(y * alpha)
+        complexity = torch.sum(torch.log(torch.diag(L))) + 0.5 * N * math.log(2.0 * math.pi)
+        
+        expected_log_lik = -(data_fit + complexity)
+
+        # Analytical KL Divergence for q(X_phys) = N(X_nom, V) vs p(X_phys) = N(X_nom, S_u)
+        kl_div = 0.5 * N * torch.sum((self.V / self.S_u) + self.log_S_u - self.log_V - 1.0)
+
+        elbo = expected_log_lik - kl_div
+        return elbo
+
+    def forward(self, X, y):
+        return -self.compute_elbo(X, y)
+
+    def fit(self, X, y, n_restart=1, outer_iters=15, inner_kernel_steps=10, inner_su_steps=10, lr_kernel=0.03, lr_su=0.03):
         self.X_train = X
         self.y_train = y
-        
-        print(">>> Phase A: Warm Start (Learning Kernel Curvature)...")
-        opt_kernel = torch.optim.Adam(self.kernel.parameters(), lr=lr)
-        for epoch in range(iter_warmup):
-            opt_kernel.zero_grad()
-            loss = self(X, y)
-            loss.backward()
-            opt_kernel.step()
+
+        base_log_S_u = self.log_S_u.data.clone()
+        base_log_V = self.log_V.data.clone()
+        base_kernel_state = {k: v.clone() for k, v in self.kernel.state_dict().items()}
+        base_log_sigma_obs = self.log_sigma_obs.data.clone()
+
+        best_elbo = -float('inf')
+        best_state = None
+        best_history = None
+
+        if n_restart > 1:
+            print(f">>> Running Multi-Restart ELBO Optimization (n_restart = {n_restart})...")
+
+        for restart in range(n_restart):
+            if restart == 0:
+                self.log_S_u.data.copy_(base_log_S_u)
+                self.log_V.data.copy_(base_log_V)
+            else:
+                rand_perturb_S = torch.randn_like(base_log_S_u) * 0.5
+                rand_perturb_V = torch.randn_like(base_log_V) * 0.5
+                self.log_S_u.data.copy_(base_log_S_u + rand_perturb_S)
+                self.log_V.data.copy_(base_log_V + rand_perturb_V)
             
-        print(">>> Phase B: Joint Training (Estimating S_u)...")
-        # Optimize all parameters together
-        opt_joint = torch.optim.Adam(self.parameters(), lr=lr*0.5) 
-        
-        for epoch in range(iter_joint):
-            opt_joint.zero_grad()
-            loss = self(X, y)
-            loss.backward()
-            opt_joint.step()
-            
-            # Track history for plotting
-            self.history['loss'].append(loss.item())
-            self.history['S_u'].append(self.S_u.detach().clone().cpu().numpy())
-            
-            if (epoch + 1) % 10 == 0:
-                print(f"Iter {epoch+1:02d}/{iter_joint} | Loss: {loss.item():.4f} | Est. S_u: {self.S_u[0].item():.4f}")
+            self.kernel.load_state_dict(base_kernel_state)
+            self.log_sigma_obs.data.copy_(base_log_sigma_obs)
+
+            kernel_params = list(self.kernel.parameters()) + [self.log_sigma_obs]
+            su_var_params = [self.log_S_u, self.log_V]
+
+            opt_kernel = torch.optim.Adam(kernel_params, lr=lr_kernel)
+            opt_su = torch.optim.Adam(su_var_params, lr=lr_su)
+
+            restart_history = {'loss': [], 'elbo': [], 'S_u': [], 'V': []}
+
+            for outer in range(outer_iters):
+                # Step A: Optimize Kernel Parameters (Hold S_u and V fixed)
+                for _ in range(inner_kernel_steps):
+                    opt_kernel.zero_grad()
+                    elbo = self.compute_elbo(X, y)
+                    loss = -elbo
+                    loss.backward()
+                    opt_kernel.step()
+
+                # Step B: Optimize S_u & Variational Variance V (Hold Kernel parameters fixed)
+                for _ in range(inner_su_steps):
+                    opt_su.zero_grad()
+                    elbo = self.compute_elbo(X, y)
+                    loss = -elbo
+                    loss.backward()
+                    opt_su.step()
+
+                current_elbo = elbo.item()
+                current_Su = self.S_u.detach().clone().cpu().numpy()
+                current_V = self.V.detach().clone().cpu().numpy()
+
+                restart_history['loss'].append(-current_elbo)
+                restart_history['elbo'].append(current_elbo)
+                restart_history['S_u'].append(current_Su)
+                restart_history['V'].append(current_V)
+
+            final_elbo = current_elbo
+            if n_restart > 1:
+                print(f"  [Restart {restart+1}/{n_restart}] Final ELBO: {final_elbo:.4f} | Est. S_u: {current_Su}")
+
+            if final_elbo > best_elbo:
+                best_elbo = final_elbo
+                best_state = {k: v.clone() for k, v in self.state_dict().items()}
+                best_history = restart_history
+
+        self.load_state_dict(best_state)
+        self.history = best_history
+
+        if n_restart > 1:
+            print(f">>> Best Restart Selected | Highest ELBO: {best_elbo:.4f} | Final S_u: {self.S_u.detach().cpu().numpy()}\n")
 
         # Final Cache for Predictions
         with torch.no_grad():
@@ -184,83 +256,205 @@ class NNGP_EIV_PyTorch(nn.Module):
 
     def predict(self, X_test):
         with torch.no_grad():
-            K_star = self.kernel(X_test, self.X_train)
-            K_star_star = self.kernel(X_test)
+            corr_train = self._compute_delta_correction(self.X_train)
+            corr_test = self._compute_delta_correction(X_test)
+            
+            delta_test = 0.5 * torch.diag(corr_test).unsqueeze(1)
+            delta_train = 0.5 * torch.diag(corr_train).unsqueeze(0)
+            
+            K_star = self.kernel(X_test, self.X_train) + delta_test + delta_train
+            K_star_star = self.kernel(X_test) + corr_test
             
             mu = K_star @ self.alpha
             v = torch.linalg.solve_triangular(self.L, K_star.T, upper=False)
             
-            # We add the test-point correction to the predictive variance
-            corr_test = self._compute_delta_correction(X_test)
-            pred_var = torch.diag(K_star_star) + torch.diag(corr_test) - torch.sum(v**2, dim=0)
+            pred_var = torch.diag(K_star_star) - torch.sum(v**2, dim=0) + (self.sigma_obs**2)
             
             return mu, torch.abs(pred_var)
 
 # ==========================================
 # 3. TOY PROBLEM EXECUTION (BERKSON ERROR)
 # ==========================================
-def run_berkson_toy_problem():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running on: {device}\n")
-
-    # --- A. Generate Berkson Data ---
-    torch.manual_seed(42)
-    N = 60
-    d = 1
-    TRUE_S_U = 0.05 # The Ground Truth we want to recover
-
-    # 1. Nominal Inputs (What the model sees)
-    X_nom = torch.linspace(-4, 4, N, dtype=torch.float64, device=device).unsqueeze(1)
-
-    # 2. Hidden Input Noise (What physically happens)
-    u_noise = torch.randn_like(X_nom) * math.sqrt(TRUE_S_U)
-    X_phys = X_nom + u_noise
-
-    # 3. The Physical Process (Parabola)
-    y = -0.25 * (X_phys**2) + 2.0 + (torch.randn_like(X_phys) * 0.1)
-
-    # --- B. Train the Model ---
-    # We deliberately initialize the kernel flexibly to allow curvature
-    kernel = GenArccos(input_dim=d, n_layers=2, s_b=[0.5, 0.5], s_w=[2.0, 1.5]).to(device)
+def get_environment_info():
+    cuda_avail = torch.cuda.is_available()
+    mps_avail = getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()
     
-    # We deliberately start S_u with a terrible guess (0.01)
-    model = NNGP_EIV_PyTorch(kernel, input_dim=d, S_u_init=0.01, sigma_obs_init=0.1).to(device)
+    if cuda_avail:
+        device = torch.device("cuda")
+        device_name = f"CUDA GPU ({torch.cuda.get_device_name(0)})"
+        default_dtype = torch.float64
+    elif mps_avail:
+        device = torch.device("mps")
+        device_name = "Apple Silicon GPU (MPS)"
+        # Metal MPS native hardware operates best on FP32
+        default_dtype = torch.float32
+    else:
+        device = torch.device("cpu")
+        device_name = "CPU"
+        default_dtype = torch.float64
+        
+    env_info = {
+        "Python Version": platform.python_version(),
+        "PyTorch Version": torch.__version__,
+        "OS": f"{platform.system()} {platform.release()}",
+        "Device": device_name,
+        "Precision (dtype)": str(default_dtype).split('.')[-1],
+    }
+    return device, default_dtype, env_info
 
-    model.fit(X_nom, y, iter_warmup=25, iter_joint=75, lr=0.05)
+def set_seed(seed=42, device=None):
+    torch.manual_seed(seed)
+    if device is not None and device.type == 'cuda':
+        torch.cuda.manual_seed_all(seed)
+    elif device is not None and device.type == 'mps':
+        if hasattr(torch.mps, 'manual_seed'):
+            torch.mps.manual_seed(seed)
+
+def run_berkson_toy_problem(input_dim=1, n_restart=3, show_plot=True, save_plot=None):
+    device, dtype, env_info = get_environment_info()
+    set_seed(42, device)
+    
+    print("=" * 50)
+    print(" CROSS-PLATFORM PYTORCH ENVIRONMENT DIAGNOSTICS")
+    print("=" * 50)
+    for k, v in env_info.items():
+        print(f"  {k:<20}: {v}")
+    print(f"  {'Problem Dimension':<20}: {input_dim}-D")
+    print(f"  {'Restarts (n_restart)':<20}: {n_restart}")
+    print("=" * 50 + "\n")
+
+    if input_dim == 1:
+        # --- A1. Generate 1D Berkson Data ---
+        N = 60
+        TRUE_S_U = torch.tensor([0.05], dtype=dtype, device=device)
+
+        # 1. Nominal Inputs (What the model sees)
+        X_nom = torch.linspace(-4, 4, N, dtype=dtype, device=device).unsqueeze(1)
+
+        # 2. Hidden Input Noise (What physically happens)
+        u_noise = torch.randn_like(X_nom) * torch.sqrt(TRUE_S_U)
+        X_phys = X_nom + u_noise
+
+        # 3. The Physical Process (Parabola)
+        y = -0.25 * (X_phys**2) + 2.0 + (torch.randn_like(X_phys) * 0.1)
+
+        X_test = torch.linspace(-5, 5, 100, dtype=dtype, device=device).unsqueeze(1)
+        y_test_true = -0.25 * (X_test**2) + 2.0
+
+    elif input_dim == 4:
+        # --- A2. Generate 4D Berkson Data ---
+        N = 100
+        TRUE_S_U = torch.tensor([0.05, 0.03, 0.08, 0.04], dtype=dtype, device=device)
+
+        # 1. Nominal Inputs in [-3, 3]^4
+        X_nom = (torch.rand(N, 4, dtype=dtype, device=device) * 6.0 - 3.0)
+
+        # 2. Hidden Input Noise per dimension
+        u_noise = torch.randn_like(X_nom) * torch.sqrt(TRUE_S_U)
+        X_phys = X_nom + u_noise
+
+        # 3. 4D Non-linear physical function with non-zero curvature across all dimensions
+        c_weights = torch.tensor([1.0, 0.8, 1.2, 0.5], dtype=dtype, device=device)
+        y_quad = -0.25 * torch.sum((X_phys**2) * c_weights, dim=1, keepdim=True)
+        y_trig = 0.5 * torch.sin(X_phys[:, 0:1]) + 0.5 * torch.cos(X_phys[:, 1:2])
+        y = y_quad + y_trig + 2.0 + (torch.randn(N, 1, dtype=dtype, device=device) * 0.1)
+
+        # Test set in [-3.5, 3.5]^4
+        N_test = 200
+        X_test = (torch.rand(N_test, 4, dtype=dtype, device=device) * 7.0 - 3.5)
+        y_test_quad = -0.25 * torch.sum((X_test**2) * c_weights, dim=1, keepdim=True)
+        y_test_trig = 0.5 * torch.sin(X_test[:, 0:1]) + 0.5 * torch.cos(X_test[:, 1:2])
+        y_test_true = y_test_quad + y_test_trig + 2.0
+
+    else:
+        raise ValueError(f"Unsupported input dimension: {input_dim}. Choose 1 or 4.")
+
+    kernel = GenArccos(input_dim=input_dim, n_layers=2, s_b=[0.5, 0.5], s_w=[2.0, 1.5], dtype=dtype).to(device)
+    S_u_init_val = 0.01 if input_dim == 1 else [0.01, 0.015, 0.008, 0.012]
+    model = NNGP_EIV(kernel, input_dim=input_dim, S_u_init=S_u_init_val, sigma_obs_init=0.1, dtype=dtype).to(device)
+
+    model.fit(X_nom, y, n_restart=n_restart, outer_iters=15, inner_kernel_steps=10, inner_su_steps=10, lr_kernel=0.03, lr_su=0.03)
 
     # --- C. Predict & Evaluate ---
-    X_test = torch.linspace(-5, 5, 100, dtype=torch.float64, device=device).unsqueeze(1)
     mu, var = model.predict(X_test)
     std = torch.sqrt(var).cpu().numpy().flatten()
     
-    X_test_np = X_test.cpu().numpy().flatten()
     mu_np = mu.cpu().numpy().flatten()
-    y_true_np = -0.25 * (X_test_np**2) + 2.0
+    y_true_np = y_test_true.cpu().numpy().flatten()
+
+    rmse = math.sqrt(float(torch.mean((mu - y_test_true)**2).item()))
+    print(f"\n>>> Prediction Evaluation (Test RMSE): {rmse:.4f}")
+    print(">>> Final Estimated S_u vs Ground Truth:")
+    final_Su = model.S_u.detach().cpu().numpy()
+    true_Su_np = TRUE_S_U.cpu().numpy()
+    for d_idx in range(input_dim):
+        print(f"    Dim {d_idx+1}: Estimated S_u = {final_Su[d_idx]:.4f} | True S_u = {true_Su_np[d_idx]:.4f}")
 
     # --- D. Plotting ---
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(13, 5))
 
-    # Subplot 1: Function Fit
-    plt.subplot(1, 2, 1)
-    plt.scatter(X_nom.cpu(), y.cpu(), c='red', alpha=0.5, label='Noisy Obs')
-    plt.plot(X_test_np, y_true_np, 'k--', label='True Latent Func')
-    plt.plot(X_test_np, mu_np, 'b-', linewidth=2, label='NNGP Mean')
-    plt.fill_between(X_test_np, mu_np - 1.96*std, mu_np + 1.96*std, color='blue', alpha=0.2, label='95% CI')
-    plt.title("Function Fit with Berkson Error")
-    plt.legend()
+    if input_dim == 1:
+        X_test_np = X_test.cpu().numpy().flatten()
+        # Subplot 1: 1D Function Fit
+        plt.subplot(1, 2, 1)
+        plt.scatter(X_nom.cpu(), y.cpu(), c='red', alpha=0.5, label='Noisy Obs')
+        plt.plot(X_test_np, y_true_np, 'k--', label='True Latent Func')
+        plt.plot(X_test_np, mu_np, 'b-', linewidth=2, label='NNGP Mean')
+        plt.fill_between(X_test_np, mu_np - 1.96*std, mu_np + 1.96*std, color='blue', alpha=0.2, label='95% CI')
+        plt.title("Function Fit with 1D Berkson Error")
+        plt.xlabel("x")
+        plt.ylabel("y")
+        plt.legend()
+    else:
+        # Subplot 1: 4D True vs Predicted Scatter Plot
+        plt.subplot(1, 2, 1)
+        plt.scatter(y_true_np, mu_np, c='blue', alpha=0.6, edgecolors='k', label='Test Points')
+        min_val = min(y_true_np.min(), mu_np.min())
+        max_val = max(y_true_np.max(), mu_np.max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Ideal 1:1 Line')
+        plt.title(f"4D Function Fit (Test RMSE: {rmse:.3f})")
+        plt.xlabel("True Latent Output y")
+        plt.ylabel("NNGP Predicted Mean ŷ")
+        plt.legend()
 
     # Subplot 2: Variance Convergence
     plt.subplot(1, 2, 2)
-    Su_history = [s[0] for s in model.history['S_u']] # Extract dimension 0
-    plt.axhline(TRUE_S_U, color='k', linestyle='--', label=f'True S_u ({TRUE_S_U})')
-    plt.plot(range(len(Su_history)), Su_history, 'g-', linewidth=2, label='Estimated S_u')
-    plt.title(f"Input Noise Inference\nFinal Estimate: {Su_history[-1]:.3f}")
+    colors = ['g', 'm', 'c', 'orange']
+    for d_idx in range(input_dim):
+        Su_history = [s[d_idx] for s in model.history['S_u']]
+        c = colors[d_idx % len(colors)]
+        plt.axhline(true_Su_np[d_idx], color=c, linestyle='--', alpha=0.7,
+                    label=f'True S_u[{d_idx+1}] ({true_Su_np[d_idx]:.2f})')
+        plt.plot(range(len(Su_history)), Su_history, color=c, linewidth=2,
+                 label=f'Est S_u[{d_idx+1}] (Final: {Su_history[-1]:.3f})')
+                 
+    plt.title(f"Input Noise Inference ({input_dim}-D)")
     plt.xlabel("Joint Training Iteration")
-    plt.ylabel("Variance")
-    plt.legend()
+    plt.ylabel("Variance (S_u)")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') if input_dim > 1 else plt.legend()
 
     plt.tight_layout()
-    plt.show()
+    if save_plot:
+        os.makedirs(os.path.dirname(os.path.abspath(save_plot)), exist_ok=True)
+        plt.savefig(save_plot, dpi=300, bbox_inches='tight')
+        print(f">>> Plot saved to: {save_plot}")
+    if show_plot:
+        plt.show()
+    plt.close()
 
 if __name__ == "__main__":
-    run_berkson_toy_problem()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="PyTorch NNGP-EIV Berkson Error Toy Problem")
+    parser.add_argument("dim_pos", type=int, nargs="?", default=None, help="Dimension of the toy problem (1 or 4)")
+    parser.add_argument("--dim", "-d", type=int, default=1, choices=[1, 4], help="Dimension of the toy problem (1 or 4). Default: 1")
+    parser.add_argument("--n-restart", "-n", type=int, default=3, help="Number of multi-restart optimizations (default: 3)")
+    parser.add_argument("--no-plot", action="store_true", help="Do not display plot GUI")
+    parser.add_argument("--save-plot", type=str, default=None, help="Path to save generated plot image")
+    
+    args = parser.parse_args()
+    target_dim = args.dim_pos if args.dim_pos is not None else args.dim
+    if target_dim not in [1, 4]:
+        parser.error("Dimension must be 1 or 4.")
+        
+    run_berkson_toy_problem(input_dim=target_dim, n_restart=args.n_restart, show_plot=not args.no_plot, save_plot=args.save_plot)

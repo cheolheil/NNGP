@@ -1,0 +1,16 @@
+# CR_NNGP Project Dependencies
+# Works across macOS (Apple Silicon M-series) and Windows (Intel / NVIDIA CUDA)
+
+# Core Deep Learning & Tensor Operations
+torch>=2.0.0
+
+# Scientific Computing & Math
+numpy>=1.22.0
+scipy>=1.8.0
+
+# Visualization
+matplotlib>=3.5.0
+
+# Jupyter Notebook Support
+ipykernel>=6.0.0
+notebook>=6.4.0

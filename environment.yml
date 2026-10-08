@@ -1,0 +1,13 @@
+name: cr_nngp
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - pytorch>=2.0.0
+  - numpy>=1.22.0
+  - scipy>=1.8.0
+  - matplotlib>=3.5.0
+  - ipykernel>=6.0.0
+  - notebook>=6.4.0
