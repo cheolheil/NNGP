@@ -7,6 +7,7 @@ import platform
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+from nngp_delta import kernel_delta, expected_log_likelihood_delta
 
 # ==========================================
 # 1. THE PYTORCH ARCCOSINE KERNEL
@@ -45,55 +46,39 @@ class GenArccos(nn.Module):
             return self.s_w[0] * ((X * self.D_param) @ Y.T) + self.s_b[0]
         return ((X * self.D_param) @ Y.T) + self.s_b[0]
 
-    def forward(self, X, Y=None):
-        is_auto = Y is None
-        if is_auto: Y = X
-        
-        K = self._init_layer(X, Y)
-        
-        if self.n_layers > 1:
-            if is_auto:
-                K_XX = K
-            else:
-                K_XX = self._init_layer(X, X)
-                K_YY = self._init_layer(Y, Y)
-                
-            for l in range(1, self.n_layers):
-                s_w_l = self.s_w[l] if self._D_fixed else self.s_w[l-1]
-                s_b_l = self.s_b[l]
-
-                if is_auto:
-                    k_diag = torch.diag(K_XX)
-                    sqrt_K_outer = torch.sqrt(torch.outer(k_diag, k_diag))
-                    cos_theta = torch.clamp(K_XX / sqrt_K_outer, -1.0 + 1e-7, 1.0 - 1e-7)
-                    theta_mat = torch.acos(cos_theta)
-                    J1 = torch.sin(theta_mat) + (math.pi - theta_mat) * cos_theta
-                    K_XX = (0.5 / math.pi) * s_w_l * sqrt_K_outer * J1 + s_b_l
-                    K = K_XX 
-                else:
-                    kX_diag = torch.diag(K_XX)
-                    kY_diag = torch.diag(K_YY)
-                    sqrt_KX_outer = torch.sqrt(torch.outer(kX_diag, kX_diag))
-                    sqrt_KY_outer = torch.sqrt(torch.outer(kY_diag, kY_diag))
-                    sqrt_K_outer = torch.sqrt(torch.outer(kX_diag, kY_diag))
-                    
-                    cos_thetaX = torch.clamp(K_XX / sqrt_KX_outer, -1.0 + 1e-7, 1.0 - 1e-7)
-                    cos_thetaY = torch.clamp(K_YY / sqrt_KY_outer, -1.0 + 1e-7, 1.0 - 1e-7)
-                    cos_theta  = torch.clamp(K / sqrt_K_outer, -1.0 + 1e-7, 1.0 - 1e-7)
-                    
-                    thetaX_mat = torch.acos(cos_thetaX)
-                    thetaY_mat = torch.acos(cos_thetaY)
-                    theta_mat  = torch.acos(cos_theta)
-                    
-                    J1_X = torch.sin(thetaX_mat) + (math.pi - thetaX_mat) * cos_thetaX
-                    J1_Y = torch.sin(thetaY_mat) + (math.pi - thetaY_mat) * cos_thetaY
-                    J1   = torch.sin(theta_mat)  + (math.pi - theta_mat)  * cos_theta
-                    
-                    K_XX = (0.5 / math.pi) * s_w_l * sqrt_KX_outer * J1_X + s_b_l
-                    K_YY = (0.5 / math.pi) * s_w_l * sqrt_KY_outer * J1_Y + s_b_l
-                    K    = (0.5 / math.pi) * s_w_l * sqrt_K_outer  * J1   + s_b_l
-
+    def paired(self, X, Y):
+        """Kernel for corresponding rows, including the C2 coincident-input limit."""
+        scale = self.D_param * (self.s_w[0] if self._D_fixed else 1.0)
+        K = ((X * scale) * Y).sum(-1) + self.s_b[0]
+        qx = ((X * scale) * X).sum(-1) + self.s_b[0]
+        qy = ((Y * scale) * Y).sum(-1) + self.s_b[0]
+        for l in range(1, self.n_layers):
+            weight = self.s_w[l] if self._D_fixed else self.s_w[l-1]
+            bias = self.s_b[l]
+            norm = torch.sqrt(qx * qy)
+            ratio = K / norm
+            eps = 8 * torch.finfo(K.dtype).eps
+            c = ratio.clamp(-1 + eps, 1 - eps)
+            theta = torch.acos(c)
+            interior = norm * (torch.sqrt(1 - c.square()) + (math.pi - theta) * c) / (2 * math.pi)
+            moment = torch.where(ratio >= 1 - eps, 0.5 * K,
+                                 torch.where(ratio <= -1 + eps, torch.zeros_like(K), interior))
+            K = weight * moment + bias
+            qx = 0.5 * weight * qx + bias
+            qy = 0.5 * weight * qy + bias
         return K
+
+    def diagonal(self, X):
+        scale = self.D_param * (self.s_w[0] if self._D_fixed else 1.0)
+        result = ((X * scale) * X).sum(-1) + self.s_b[0]
+        for l in range(1, self.n_layers):
+            weight = self.s_w[l] if self._D_fixed else self.s_w[l-1]
+            result = 0.5 * weight * result + self.s_b[l]
+        return result
+
+    def forward(self, X, Y=None):
+        Y = X if Y is None else Y
+        return self.paired(X[:, None, :], Y[None, :, :])
 
 # ==========================================
 # 2. THE PYTORCH NNGP-EIV CLASS
@@ -128,38 +113,15 @@ class NNGP_EIV(nn.Module):
     @property
     def V(self): return torch.exp(self.log_V)
 
-    def _compute_delta_correction(self, X, V_override=None):
-        N, D = X.shape
-        V_curr = V_override if V_override is not None else self.V
-
-        with torch.enable_grad():
-            X_req = X.detach().clone().requires_grad_(True)
-            K_diag = torch.diag(self.kernel(X_req))
-
-            g1 = torch.autograd.grad(K_diag.sum(), X_req, create_graph=True)[0]
-
-            second_diag = torch.zeros_like(X_req)
-            for d in range(D):
-                g2_d = torch.autograd.grad(g1[:, d].sum(), X_req, create_graph=True if self.training else False)[0][:, d]
-                second_diag[:, d] = g2_d
-
-            point_corrections = 0.5 * torch.sum(second_diag * V_curr, dim=1)
-        return point_corrections.unsqueeze(1) + point_corrections.unsqueeze(0)
+    def _compute_delta_correction(self, X, V_override=None, Y=None, variance_y=None):
+        variance = self.V if V_override is None else V_override
+        return kernel_delta(self.kernel, X, variance, Y, variance_y)
 
     def compute_elbo(self, X, y):
+        """Second-order approximation of the ELBO, not a guaranteed bound."""
         N, D = X.shape
-        K_nom = self.kernel(X)
-        K_corr = self._compute_delta_correction(X)
-        jitter = (self.sigma_obs**2) * torch.eye(N, device=X.device, dtype=X.dtype)
-        K_eff = K_nom + K_corr + jitter
-
-        L = torch.linalg.cholesky(K_eff)
-        alpha = torch.cholesky_solve(y, L)
-
-        data_fit = 0.5 * torch.sum(y * alpha)
-        complexity = torch.sum(torch.log(torch.diag(L))) + 0.5 * N * math.log(2.0 * math.pi)
-        
-        expected_log_lik = -(data_fit + complexity)
+        expected_log_lik = expected_log_likelihood_delta(
+            self.kernel, X, y, self.V, self.sigma_obs)
 
         # Analytical KL Divergence for q(X_phys) = N(X_nom, V) vs p(X_phys) = N(X_nom, S_u)
         kl_div = 0.5 * N * torch.sum((self.V / self.S_u) + self.log_S_u - self.log_V - 1.0)
@@ -233,7 +195,8 @@ class NNGP_EIV(nn.Module):
                 restart_history['S_u'].append(current_Su)
                 restart_history['V'].append(current_V)
 
-            final_elbo = current_elbo
+            with torch.no_grad():
+                final_elbo = self.compute_elbo(X, y).item()
             if n_restart > 1:
                 print(f"  [Restart {restart+1}/{n_restart}] Final ELBO: {final_elbo:.4f} | Est. S_u: {current_Su}")
 
@@ -254,23 +217,27 @@ class NNGP_EIV(nn.Module):
             self.L = torch.linalg.cholesky(K_eff)
             self.alpha = torch.cholesky_solve(y, self.L)
 
-    def predict(self, X_test):
+    def predict(self, X_test, input_variance=None, include_observation_noise=True):
+        """Moment-matched prediction; default test inputs are exact latent inputs.
+
+        Pass input_variance (a vector of variances) for noisy test inputs.
+        The variational model uses q's variance for training moments and the
+        joint model uses S_u. This prediction is a moment approximation.
+        """
         with torch.no_grad():
-            corr_train = self._compute_delta_correction(self.X_train)
-            corr_test = self._compute_delta_correction(X_test)
-            
-            delta_test = 0.5 * torch.diag(corr_test).unsqueeze(1)
-            delta_train = 0.5 * torch.diag(corr_train).unsqueeze(0)
-            
-            K_star = self.kernel(X_test, self.X_train) + delta_test + delta_train
-            K_star_star = self.kernel(X_test) + corr_test
-            
+            test_variance = torch.zeros(self.input_dim, dtype=X_test.dtype, device=X_test.device) if input_variance is None else torch.as_tensor(input_variance, dtype=X_test.dtype, device=X_test.device).expand(self.input_dim)
+            K_star = self.kernel(X_test, self.X_train) + kernel_delta(
+                self.kernel, X_test, test_variance, self.X_train, self.V)
+            K_star_star = self.kernel(X_test) + kernel_delta(self.kernel, X_test, test_variance)
             mu = K_star @ self.alpha
             v = torch.linalg.solve_triangular(self.L, K_star.T, upper=False)
-            
-            pred_var = torch.diag(K_star_star) - torch.sum(v**2, dim=0) + (self.sigma_obs**2)
-            
-            return mu, torch.abs(pred_var)
+            pred_var = K_star_star.diagonal() - torch.sum(v.square(), dim=0)
+            if include_observation_noise:
+                pred_var = pred_var + self.sigma_obs.square()
+            tolerance = 100 * torch.finfo(pred_var.dtype).eps * K_star_star.diagonal().abs().max().clamp_min(1)
+            if (pred_var < -tolerance).any():
+                raise RuntimeError("Delta covariance produced negative predictive variance; reduce input variance or use input integration.")
+            return mu, pred_var.clamp_min(0)
 
 # ==========================================
 # 3. TOY PROBLEM EXECUTION (BERKSON ERROR)
