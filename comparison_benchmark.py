@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from nngp_torch import GenArccos, NNGP_EIV, set_seed
-from nngp_torch_joint import NNGP_EIV_Joint
 
 ROOT = Path(__file__).resolve().parent
 ALT_SETTINGS = dict(outer_iters=15, inner_kernel_steps=10, inner_su_steps=10, lr_kernel=0.03, lr_su=0.03)
@@ -62,7 +61,7 @@ def run_method(dim, method, data, restarts):
         v=initial_v if restart==0 else (initial_v*torch.exp(torch.randn(dim,dtype=x.dtype)*0.5) if method=='alternating' else initial_v)
         kernel=GenArccos(dim,2,[0.5,0.5],[2.,1.5],dtype=x.dtype)
         model=(NNGP_EIV(kernel,dim,S_u_init=su.tolist(),V_init=v.tolist(),sigma_obs_init=0.1)
-               if method=='alternating' else NNGP_EIV_Joint(kernel,dim,S_u_init=su.tolist(),sigma_obs_init=0.1))
+               if method=='alternating' else NNGP_EIV(kernel,dim,S_u_init=su.tolist(),sigma_obs_init=0.1,inference_method='joint'))
         record=dict(restart=restart+1,initial_S_u=vector(su),initial_V=vector(v) if method=='alternating' else None)
         started=time.perf_counter()
         print(f'{dim}D {method} restart {restart+1}/{restarts}: training',flush=True)

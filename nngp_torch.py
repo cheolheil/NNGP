@@ -84,8 +84,10 @@ class GenArccos(nn.Module):
 # 2. THE PYTORCH NNGP-EIV CLASS
 # ==========================================
 class NNGP_EIV(nn.Module):
-    def __init__(self, kernel, input_dim, S_u_init=1e-3, sigma_obs_init=0.1, V_init=1e-3, dtype=torch.float64):
+    def __init__(self, kernel, input_dim, S_u_init=1e-3, sigma_obs_init=0.1, V_init=1e-3, dtype=torch.float64, inference_method="alternating"):
         super().__init__()
+        self._validate_inference_method(inference_method)
+        self.inference_method = inference_method
         self.kernel = kernel
         self.input_dim = input_dim
         self.dtype = dtype
@@ -114,7 +116,7 @@ class NNGP_EIV(nn.Module):
     def V(self): return torch.exp(self.log_V)
 
     def _compute_delta_correction(self, X, V_override=None, Y=None, variance_y=None):
-        variance = self.V if V_override is None else V_override
+        variance = self.training_input_variance if V_override is None else V_override
         return kernel_delta(self.kernel, X, variance, Y, variance_y)
 
     def compute_elbo(self, X, y):
@@ -129,10 +131,59 @@ class NNGP_EIV(nn.Module):
         elbo = expected_log_lik - kl_div
         return elbo
 
-    def forward(self, X, y):
-        return -self.compute_elbo(X, y)
+    def compute_nll(self, X, y):
+        N, D = X.shape
+        K_nom = self.kernel(X)
+        K_corr = self._compute_delta_correction(X)
+        jitter = (self.sigma_obs**2) * torch.eye(N, device=X.device, dtype=X.dtype)
+        K_eff = K_nom + K_corr + jitter
 
-    def fit(self, X, y, n_restart=1, outer_iters=15, inner_kernel_steps=10, inner_su_steps=10, lr_kernel=0.03, lr_su=0.03):
+        L = torch.linalg.cholesky(K_eff)
+        alpha = torch.cholesky_solve(y, L)
+
+        data_fit = 0.5 * torch.sum(y * alpha)
+        complexity = torch.sum(torch.log(torch.diag(L))) + 0.5 * N * math.log(2.0 * math.pi)
+        return data_fit + complexity
+
+    @staticmethod
+    def _validate_inference_method(method):
+        if method not in ("alternating", "joint"):
+            raise ValueError("inference_method must be 'alternating' or 'joint'")
+
+    @property
+    def training_input_variance(self):
+        return self.V if self.inference_method == "alternating" else self.S_u
+
+    def forward(self, X, y):
+        return -self.compute_elbo(X, y) if self.inference_method == "alternating" else self.compute_nll(X, y)
+
+    def fit(self, X, y, n_restart=1, outer_iters=15, inner_kernel_steps=10,
+            inner_su_steps=10, lr_kernel=0.03, lr_su=0.03, *,
+            inference_method=None, iter_warmup=25, iter_joint=75, lr=0.05):
+        """Fit using alternating approximate ELBO or joint moment Gaussian NLL.
+
+        A fit-time method overrides the constructor selection and persists for
+        subsequent objective evaluations, prediction, and fits. Joint inference
+        does not optimize V. Both methods retain their original optimizer defaults.
+        """
+        method = self.inference_method if inference_method is None else inference_method
+        self._validate_inference_method(method)
+        if n_restart < 1:
+            raise ValueError("n_restart must be at least 1")
+        if method == "alternating" and (outer_iters < 1 or inner_kernel_steps < 1 or inner_su_steps < 1):
+            raise ValueError("Alternating iteration counts must be positive")
+        if method == "joint" and (iter_warmup < 0 or iter_joint < 1):
+            raise ValueError("iter_warmup must be nonnegative and iter_joint positive")
+        self.inference_method = method
+        if method == "joint":
+            self._fit_joint(X, y, n_restart, iter_warmup, iter_joint, lr)
+        else:
+            self._fit_alternating(X, y, n_restart, outer_iters, inner_kernel_steps,
+                                  inner_su_steps, lr_kernel, lr_su)
+        return self
+
+    def _fit_alternating(self, X, y, n_restart, outer_iters, inner_kernel_steps,
+                         inner_su_steps, lr_kernel, lr_su):
         self.X_train = X
         self.y_train = y
 
@@ -217,6 +268,72 @@ class NNGP_EIV(nn.Module):
             self.L = torch.linalg.cholesky(K_eff)
             self.alpha = torch.cholesky_solve(y, self.L)
 
+    def _fit_joint(self, X, y, n_restart=1, iter_warmup=25, iter_joint=75, lr=0.05):
+        self.X_train = X
+        self.y_train = y
+
+        base_log_S_u = self.log_S_u.data.clone()
+        base_kernel_state = {k: v.clone() for k, v in self.kernel.state_dict().items()}
+        base_log_sigma_obs = self.log_sigma_obs.data.clone()
+
+        best_nll = float('inf')
+        best_state = None
+        best_history = None
+
+        if n_restart > 1:
+            print(f">>> Running Multi-Restart Joint NLL Optimization (n_restart = {n_restart})...")
+
+        for restart in range(n_restart):
+            if restart == 0:
+                self.log_S_u.data.copy_(base_log_S_u)
+            else:
+                rand_perturb_S = torch.randn_like(base_log_S_u) * 0.5
+                self.log_S_u.data.copy_(base_log_S_u + rand_perturb_S)
+
+            self.kernel.load_state_dict(base_kernel_state)
+            self.log_sigma_obs.data.copy_(base_log_sigma_obs)
+
+            opt_kernel = torch.optim.Adam(list(self.kernel.parameters()) + [self.log_sigma_obs], lr=lr)
+            for epoch in range(iter_warmup):
+                opt_kernel.zero_grad()
+                loss = self(X, y)
+                loss.backward()
+                opt_kernel.step()
+
+            opt_joint = torch.optim.Adam(list(self.kernel.parameters()) + [self.log_sigma_obs, self.log_S_u], lr=lr*0.5)
+            restart_history = {'loss': [], 'S_u': []}
+
+            for epoch in range(iter_joint):
+                opt_joint.zero_grad()
+                loss = self(X, y)
+                loss.backward()
+                opt_joint.step()
+
+                restart_history['loss'].append(loss.item())
+                restart_history['S_u'].append(self.S_u.detach().clone().cpu().numpy())
+
+            with torch.no_grad():
+                final_nll = self.compute_nll(X, y).item()
+            current_Su = self.S_u.detach().clone().cpu().numpy()
+            if n_restart > 1:
+                print(f"  [Restart {restart+1}/{n_restart}] Final NLL: {final_nll:.4f} | Est. S_u: {current_Su}")
+
+            if final_nll < best_nll:
+                best_nll = final_nll
+                best_state = {k: v.clone() for k, v in self.state_dict().items()}
+                best_history = restart_history
+
+        self.load_state_dict(best_state)
+        self.history = best_history
+
+        if n_restart > 1:
+            print(f">>> Best Restart Selected | Lowest NLL: {best_nll:.4f} | Final S_u: {self.S_u.detach().cpu().numpy()}\n")
+
+        with torch.no_grad():
+            K_eff = self.kernel(X) + self._compute_delta_correction(X) + (self.sigma_obs**2) * torch.eye(X.shape[0], device=X.device, dtype=X.dtype)
+            self.L = torch.linalg.cholesky(K_eff)
+            self.alpha = torch.cholesky_solve(y, self.L)
+
     def predict(self, X_test, input_variance=None, include_observation_noise=True):
         """Moment-matched prediction; default test inputs are exact latent inputs.
 
@@ -227,7 +344,7 @@ class NNGP_EIV(nn.Module):
         with torch.no_grad():
             test_variance = torch.zeros(self.input_dim, dtype=X_test.dtype, device=X_test.device) if input_variance is None else torch.as_tensor(input_variance, dtype=X_test.dtype, device=X_test.device).expand(self.input_dim)
             K_star = self.kernel(X_test, self.X_train) + kernel_delta(
-                self.kernel, X_test, test_variance, self.X_train, self.V)
+                self.kernel, X_test, test_variance, self.X_train, self.training_input_variance)
             K_star_star = self.kernel(X_test) + kernel_delta(self.kernel, X_test, test_variance)
             mu = K_star @ self.alpha
             v = torch.linalg.solve_triangular(self.L, K_star.T, upper=False)
