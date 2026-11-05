@@ -2,7 +2,7 @@ import copy
 import unittest
 import torch
 from nngp_torch import GenArccos, NNGP_EIV
-from nngp_torch_joint import NNGP_EIV_Joint
+from legacy.nngp_torch_joint import NNGP_EIV_Joint
 
 torch.set_num_threads(1)
 

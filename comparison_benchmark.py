@@ -234,7 +234,7 @@ def main():
     torch.use_deterministic_algorithms(True)
     result=dict(created_utc=datetime.now(timezone.utc).isoformat(),environment=dict(python=platform.python_version(),torch=torch.__version__,os=platform.platform(),dtype='float64',device='cpu',threads=1),
                 source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
-                source_sha256={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in ['nngp_torch.py','nngp_torch_joint.py','nngp_delta.py','comparison_benchmark.py']},
+                source_sha256={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in ['nngp_torch.py','legacy/nngp_torch_joint.py','nngp_delta.py','comparison_benchmark.py']},
                 seed=42,n_restarts=3,alternating_settings=ALT_SETTINGS,joint_settings=JOINT_SETTINGS,problems=[])
     for dim in (1,4):
         data=generate_data(dim);x,y,test,target,true_variance,fingerprint=data

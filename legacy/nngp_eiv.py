@@ -4,7 +4,10 @@ import scipy.stats as stats
 from scipy.linalg import solve_triangular
 from scipy.optimize import minimize
 
-from kernel import GenArccos
+if __package__:
+    from .kernel import GenArccos
+else:
+    from kernel import GenArccos
 
 
 class NNGPIU:

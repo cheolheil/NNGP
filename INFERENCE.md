@@ -37,10 +37,10 @@ When restoring a `state_dict`, construct the model with the same inference metho
 the method is a constructor option, not a tensor stored in the state dictionary.
 
 `NNGP_EIV_Joint` and its positional constructor/fit arguments remain supported
-through a compatibility wrapper in `nngp_torch_joint.py`. Existing joint tensor
+through a compatibility wrapper in `legacy/nngp_torch_joint.py`. Existing joint tensor
 state dictionaries can be loaded with `strict=False` because the unified model
 also owns an unused `log_V` parameter.
 
-Both toy scripts retain automatic CUDA / MPS / CPU selection. Direct library use
+The current and legacy toy scripts retain automatic CUDA / MPS / CPU selection. Direct library use
 requires moving the model and data explicitly, as above. The comparison benchmark
 uses the unified interface while retaining its CPU/float64 protocol.
